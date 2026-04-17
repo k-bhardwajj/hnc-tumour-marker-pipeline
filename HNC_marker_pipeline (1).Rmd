@@ -1,0 +1,473 @@
+---
+title: "HNC Tumour Marker Identification Pipeline"
+subtitle: "TCGA-HNSC & GSE65858 | All HNC Sites | HPV-Negative Only | Tumour vs. Normal"
+author: "Khushi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+---
+
+# 0. Install & Load Packages
+
+```{r packages}
+# Install if needed (run once, then comment out)
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("TCGAbiolinks", "DESeq2", "limma", "edgeR", "GEOquery"))
+# install.packages(c("tidyverse", "pheatmap", "ggrepel", "RColorBrewer", "openxlsx"))
+
+library(TCGAbiolinks)   # TCGA data download
+library(GEOquery)       # GEO data download
+library(DESeq2)         # TCGA differential expression (count data)
+library(limma)          # GSE65858 differential expression (microarray)
+library(edgeR)          # Normalisation support
+library(tidyverse)      # Data wrangling
+library(pheatmap)       # Heatmaps
+library(ggrepel)        # Volcano plot labels
+library(RColorBrewer)   # Colour palettes
+library(openxlsx)       # Export results to Excel
+```
+
+---
+
+# 1. TCGA-HNSC Analysis
+
+## 1.1 Download TCGA-HNSC RNA-seq Data
+
+```{r tcga-download, eval=FALSE}
+# Query TCGA-HNSC RNA-seq (HTSeq counts)
+query_tcga <- GDCquery(
+  project           = "TCGA-HNSC",
+  data.category     = "Transcriptome Profiling",
+  data.type         = "Gene Expression Quantification",
+  workflow.type     = "STAR - Counts",
+  sample.type       = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+GDCdownload(query_tcga)
+tcga_data <- GDCprepare(query_tcga)
+
+# Save to avoid re-downloading
+saveRDS(tcga_data, "tcga_hnsc_raw.rds")
+```
+
+```{r tcga-load}
+# Load saved data (use this after first download)
+tcga_data <- readRDS("tcga_hnsc_raw.rds")
+```
+
+## 1.2 Extract Counts & Clinical Metadata
+
+```{r tcga-prep}
+# Extract count matrix and sample metadata
+tcga_counts <- assay(tcga_data, "unstranded")
+tcga_meta   <- as.data.frame(colData(tcga_data))
+
+# Classify tumour vs normal
+tcga_meta$condition <- ifelse(
+  tcga_meta$sample_type == "Solid Tissue Normal",
+  "Normal", "Tumour"
+)
+
+# ----- HPV FILTERING -----
+# TCGA-HNSC uses 'paper_HPV.status' (values: "Positive", "Negative", NA)
+# Normal tissue samples do not have HPV status assigned — we retain ALL normals
+# since they are HPV-agnostic reference tissue
+
+cat("HPV status breakdown (tumour samples only):\n")
+print(table(tcga_meta$paper_HPV.status, useNA = "ifany"))
+
+# Keep: HPV-negative tumours + all normal tissue samples
+tcga_meta <- tcga_meta %>%
+  filter(
+    (condition == "Tumour" & paper_HPV.status == "Negative") |
+    condition == "Normal"
+  )
+
+# Subset count matrix to match filtered samples
+tcga_counts <- tcga_counts[, rownames(tcga_meta)]
+
+cat("\nSamples after HPV-negative filtering:\n")
+table(tcga_meta$condition)
+```
+
+## 1.3 Pre-filtering
+
+```{r tcga-filter}
+# Remove lowly expressed genes (keep genes with ≥10 counts in ≥10 samples)
+keep <- rowSums(tcga_counts >= 10) >= 10
+tcga_counts_filt <- tcga_counts[keep, ]
+
+cat("Genes before filtering:", nrow(tcga_counts), "\n")
+cat("Genes after filtering: ", nrow(tcga_counts_filt), "\n")
+```
+
+## 1.4 DESeq2 Differential Expression
+
+```{r tcga-deseq2}
+# Build DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = tcga_counts_filt,
+  colData   = tcga_meta,
+  design    = ~ condition
+)
+
+# Set reference level to Normal
+dds$condition <- relevel(dds$condition, ref = "Normal")
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Extract results: Tumour vs Normal
+tcga_res <- results(dds,
+  contrast  = c("condition", "Tumour", "Normal"),
+  alpha     = 0.05
+)
+
+# Convert to data frame and clean up
+tcga_res_df <- as.data.frame(tcga_res) %>%
+  rownames_to_column("gene") %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj, desc(log2FoldChange))
+
+# Summary
+cat("Significantly upregulated in Tumour (padj < 0.05, log2FC > 1):",
+    sum(tcga_res_df$padj < 0.05 & tcga_res_df$log2FoldChange > 1, na.rm = TRUE), "\n")
+```
+
+## 1.5 TCGA Volcano Plot
+
+```{r tcga-volcano}
+# Label top 30 upregulated genes
+tcga_res_df <- tcga_res_df %>%
+  mutate(
+    sig     = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "Upregulated",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      TRUE ~ "NS"
+    ),
+    neg_log10_p = -log10(padj)
+  )
+
+top30_tcga <- tcga_res_df %>%
+  filter(sig == "Upregulated") %>%
+  slice_max(log2FoldChange, n = 30)
+
+ggplot(tcga_res_df, aes(x = log2FoldChange, y = neg_log10_p, colour = sig)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_label_repel(
+    data    = top30_tcga,
+    aes(label = gene),
+    size    = 2.8,
+    max.overlaps = 20
+  ) +
+  scale_colour_manual(values = c(
+    "Upregulated"   = "#C0392B",
+    "Downregulated" = "#2980B9",
+    "NS"            = "grey70"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  labs(
+    title    = "TCGA-HNSC: Tumour vs. Normal",
+    x        = "log2 Fold Change",
+    y        = "-log10(adjusted p-value)",
+    colour   = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+## 1.6 TCGA Top 30 Upregulated Markers
+
+```{r tcga-top30}
+tcga_top30 <- tcga_res_df %>%
+  filter(sig == "Upregulated") %>%
+  slice_max(log2FoldChange, n = 30) %>%
+  select(gene, log2FoldChange, padj, baseMean)
+
+knitr::kable(tcga_top30, digits = 4, caption = "TCGA-HNSC: Top 30 Upregulated Genes")
+```
+
+## 1.7 TCGA Heatmap (Top 30)
+
+```{r tcga-heatmap}
+# Extract normalised counts for top 30 genes
+tcga_vst      <- vst(dds, blind = FALSE)
+top30_genes   <- tcga_top30$gene
+heatmap_mat   <- assay(tcga_vst)[top30_genes, ]
+
+# Annotation: Tumour vs Normal
+anno_col <- data.frame(
+  Condition = tcga_meta$condition,
+  row.names = colnames(heatmap_mat)
+)
+
+pheatmap(
+  heatmap_mat,
+  annotation_col   = anno_col,
+  annotation_colors = list(Condition = c(Tumour = "#C0392B", Normal = "#2980B9")),
+  show_colnames    = FALSE,
+  scale            = "row",
+  color            = colorRampPalette(c("#2980B9", "white", "#C0392B"))(100),
+  main             = "TCGA-HNSC: Top 30 Upregulated Markers",
+  fontsize_row     = 9
+)
+```
+
+## 1.8 TCGA Boxplots (Top 10)
+
+```{r tcga-boxplots, fig.height=12}
+# Normalised counts for top 10 genes
+top10_tcga   <- tcga_top30$gene[1:10]
+vst_long     <- assay(tcga_vst)[top10_tcga, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  left_join(tcga_meta %>% select(barcode, condition) %>%
+              rename(sample = barcode), by = "sample")
+
+ggplot(vst_long, aes(x = condition, y = expression, fill = condition)) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.8) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(Tumour = "#C0392B", Normal = "#2980B9")) +
+  labs(
+    title = "TCGA-HNSC: Top 10 Marker Expression",
+    x     = NULL, y = "VST-normalised expression"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+# 2. GSE65858 Analysis
+
+## 2.1 Download GSE65858
+
+```{r gse-download, eval=FALSE}
+gse <- getGEO("GSE65858", GSEMatrix = TRUE, destdir = ".")
+saveRDS(gse, "gse65858_raw.rds")
+```
+
+```{r gse-load}
+gse      <- readRDS("gse65858_raw.rds")
+gse_eset <- gse[[1]]   # ExpressionSet object
+```
+
+## 2.2 Extract Expression & Metadata
+
+```{r gse-prep}
+gse_expr <- exprs(gse_eset)           # Expression matrix (already normalised)
+gse_meta <- pData(gse_eset)           # Sample metadata
+
+# Check available columns for tumour/normal classification
+# NOTE: Inspect gse_meta column names to confirm the correct field
+# The line below may need adjusting based on actual column names
+cat("Metadata columns:\n")
+print(colnames(gse_meta))
+```
+
+```{r gse-classify}
+# Inspect metadata to find HPV status field
+# GSE65858 typically stores this in characteristics_ch1 or a dedicated column
+# Print first few rows to confirm field name
+print(head(gse_meta[, grepl("hpv|status|charact", colnames(gse_meta), ignore.case = TRUE)]))
+
+# Classify condition (tumour vs normal)
+gse_meta$condition <- ifelse(
+  grepl("normal|control", gse_meta$source_name_ch1, ignore.case = TRUE),
+  "Normal", "Tumour"
+)
+
+# ----- HPV FILTERING -----
+# GSE65858 stores HPV status in characteristics — adjust field name below
+# after inspecting the output above. Common field: "characteristics_ch1.1" or similar
+# Example extraction (update column name as needed):
+gse_meta$hpv_status <- gsub(".*hpv status: ", "", gse_meta$`characteristics_ch1.1`,
+                              ignore.case = TRUE)
+
+cat("HPV status breakdown (tumour samples only):\n")
+print(table(gse_meta$hpv_status[gse_meta$condition == "Tumour"], useNA = "ifany"))
+
+# Keep: HPV-negative tumours + all normal samples
+gse_meta <- gse_meta %>%
+  filter(
+    (condition == "Tumour" & grepl("negative|neg|0", hpv_status, ignore.case = TRUE)) |
+    condition == "Normal"
+  )
+
+# Subset expression matrix to match filtered samples
+gse_expr <- gse_expr[, rownames(gse_meta)]
+
+cat("\nSamples after HPV-negative filtering:\n")
+table(gse_meta$condition)
+```
+
+## 2.3 limma Differential Expression
+
+```{r gse-limma}
+# Design matrix
+condition      <- factor(gse_meta$condition, levels = c("Normal", "Tumour"))
+design         <- model.matrix(~ condition)
+
+# Fit linear model
+fit  <- lmFit(gse_expr, design)
+fit  <- eBayes(fit)
+
+# Extract results
+gse_res <- topTable(fit,
+  coef      = "conditionTumour",
+  number    = Inf,
+  adjust    = "BH",
+  sort.by   = "logFC"
+) %>%
+  rownames_to_column("gene") %>%
+  filter(!is.na(adj.P.Val)) %>%
+  arrange(adj.P.Val, desc(logFC))
+
+cat("Significantly upregulated in Tumour (adj.P.Val < 0.05, logFC > 1):",
+    sum(gse_res$adj.P.Val < 0.05 & gse_res$logFC > 1, na.rm = TRUE), "\n")
+```
+
+## 2.4 GSE65858 Volcano Plot
+
+```{r gse-volcano}
+gse_res <- gse_res %>%
+  mutate(
+    sig = case_when(
+      adj.P.Val < 0.05 & logFC >  1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "NS"
+    ),
+    neg_log10_p = -log10(adj.P.Val)
+  )
+
+top30_gse <- gse_res %>%
+  filter(sig == "Upregulated") %>%
+  slice_max(logFC, n = 30)
+
+ggplot(gse_res, aes(x = logFC, y = neg_log10_p, colour = sig)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_label_repel(
+    data    = top30_gse,
+    aes(label = gene),
+    size    = 2.8,
+    max.overlaps = 20
+  ) +
+  scale_colour_manual(values = c(
+    "Upregulated"   = "#C0392B",
+    "Downregulated" = "#2980B9",
+    "NS"            = "grey70"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  labs(
+    title  = "GSE65858: Tumour vs. Normal",
+    x      = "log2 Fold Change",
+    y      = "-log10(adjusted p-value)",
+    colour = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+## 2.5 GSE65858 Top 30 Upregulated Markers
+
+```{r gse-top30}
+gse_top30 <- gse_res %>%
+  filter(sig == "Upregulated") %>%
+  slice_max(logFC, n = 30) %>%
+  select(gene, logFC, adj.P.Val, AveExpr)
+
+knitr::kable(gse_top30, digits = 4, caption = "GSE65858: Top 30 Upregulated Genes")
+```
+
+## 2.6 GSE65858 Heatmap (Top 30)
+
+```{r gse-heatmap}
+top30_gse_genes <- gse_top30$gene
+heatmap_gse     <- gse_expr[top30_gse_genes, ]
+
+anno_gse <- data.frame(
+  Condition = gse_meta$condition,
+  row.names = colnames(heatmap_gse)
+)
+
+pheatmap(
+  heatmap_gse,
+  annotation_col    = anno_gse,
+  annotation_colors = list(Condition = c(Tumour = "#C0392B", Normal = "#2980B9")),
+  show_colnames     = FALSE,
+  scale             = "row",
+  color             = colorRampPalette(c("#2980B9", "white", "#C0392B"))(100),
+  main              = "GSE65858: Top 30 Upregulated Markers",
+  fontsize_row      = 9
+)
+```
+
+## 2.7 GSE65858 Boxplots (Top 10)
+
+```{r gse-boxplots, fig.height=12}
+top10_gse <- gse_top30$gene[1:10]
+
+gse_long <- gse_expr[top10_gse, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  left_join(gse_meta %>% rownames_to_column("sample") %>%
+              select(sample, condition), by = "sample")
+
+ggplot(gse_long, aes(x = condition, y = expression, fill = condition)) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.8) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(Tumour = "#C0392B", Normal = "#2980B9")) +
+  labs(
+    title = "GSE65858: Top 10 Marker Expression",
+    x     = NULL, y = "Normalised expression"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+# 3. Consensus Marker Identification
+
+## 3.1 Overlap Between Both Datasets
+
+```{r consensus}
+tcga_up_genes <- tcga_top30$gene
+gse_up_genes  <- gse_top30$gene
+
+# Consensus: genes upregulated in BOTH datasets
+consensus_genes <- intersect(tcga_up_genes, gse_up_genes)
+
+cat("Top 30 upregulated in TCGA:   ", length(tcga_up_genes), "genes\n")
+cat("Top 30 upregulated in GSE65858:", length(gse_up_genes), "genes\n")
+cat("Consensus (in both):           ", length(consensus_genes), "genes\n")
+print(consensus_genes)
+```
+
+## 3.2 Consensus Marker Table
+
+```{r consensus-table}
+# Combine stats from both datasets for consensus genes
+consensus_df <- tcga_top
